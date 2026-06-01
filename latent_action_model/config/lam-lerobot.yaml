@@ -1,0 +1,60 @@
+model:
+  image_channels: 3
+
+  lam_model_dim: 768
+  lam_latent_dim: 128
+  lam_num_latents: 16
+  lam_patch_size: 14
+  lam_enc_blocks: 12
+  lam_dec_blocks: 12
+  lam_num_heads: 12
+
+  vq_beta: 0.25
+  log_interval: 5000
+  log_path: ./logs
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 1e-4
+      weight_decay: 1e-2
+
+  task_name: lam_lerobot
+  make_data_pair: false
+  stage: stage-1
+
+data:
+  data_root_dir: /mnt/pfs/dengyiqi/datasets
+  data_mix: x2w_wm_dataset       # resolved via DATASET_NAMED_MIXTURES (see dataloader/gr00t_lerobot/mixtures.py)
+  batch_size: 64
+  frame_interval: 30             # 0.5s @ 30 fps; set to 30 for 1.0s
+  image_aug: true                # enable video augmentations (crop + color jitter)
+  video_backend: torchcodec
+  excluded_segment_statuses:     # drop idle / non-task segments
+    - Start remote operation.
+    - End remote operation.
+  num_workers: 4
+
+trainer:
+  max_epochs: 20
+  accelerator: gpu
+  num_nodes: 1
+  devices: 8
+  strategy: ddp_find_unused_parameters_false
+  precision: 16-mixed
+  log_every_n_steps: 10
+  gradient_clip_val: 0.1
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: ./logs/lam_lerobot
+        verbose: true
+        save_last: true
+        save_top_k: -1
+        every_n_train_steps: 20000
+
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: ./logs
+        name: lam_lerobot

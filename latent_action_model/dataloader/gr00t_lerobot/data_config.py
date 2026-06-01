@@ -5,16 +5,16 @@
 
 from abc import ABC, abstractmethod
 
-from latent_action_model.dataloader.gr00t_lerobot.datasets import ModalityConfig
-from latent_action_model.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
-from latent_action_model.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform, ModalityTransform
-from latent_action_model.dataloader.gr00t_lerobot.transform.concat import ConcatTransform
-from latent_action_model.dataloader.gr00t_lerobot.transform.state_action import (
+from dataloader.gr00t_lerobot.datasets import ModalityConfig
+from dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
+from dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform, ModalityTransform
+from dataloader.gr00t_lerobot.transform.concat import ConcatTransform
+from dataloader.gr00t_lerobot.transform.state_action import (
     StateActionSinCosTransform,
     StateActionToTensor,
     StateActionTransform,
 )
-from latent_action_model.dataloader.gr00t_lerobot.transform.video import (
+from dataloader.gr00t_lerobot.transform.video import (
     VideoColorJitter,
     VideoCrop,
     VideoResize,
@@ -103,6 +103,53 @@ class X2WJointDataConfig:
             ),
         ]
 
+        return ComposedModalityTransform(transforms=transforms)
+
+class LAMX2WConfig(X2WJointDataConfig):
+    """
+    Variant of X2WJointDataConfig tuned for LAM next-frame-prediction training.
+
+    Differences from parent:
+    - Single camera (head_image) instead of three.
+    - observation_indices is instance-level, configurable via set_frame_interval(N).
+    - Optionally enables video augmentations (crop + color jitter) via image_aug.
+    """
+    video_keys = ["video.head_image"]
+
+    def __init__(self, frame_interval: int = 15, image_aug: bool = True):
+        self.observation_indices = [0, frame_interval]
+        self.image_aug = image_aug
+
+    def set_frame_interval(self, n: int):
+        self.observation_indices = [0, n]
+
+    def transform(self):
+        transforms = []
+        if self.image_aug:
+            transforms += [
+                VideoCrop(apply_to=self.video_keys, scale=0.95, backend="albumentations"),
+                VideoColorJitter(
+                    apply_to=self.video_keys,
+                    brightness=0.2, contrast=(0.8, 1.2),
+                    saturation=(0.8, 1.2), hue=0.05,
+                    backend="albumentations",
+                ),
+            ]
+        transforms += [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={"state.joint_pos": "q99"},
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.joint_pos": "q99",
+                    "action.wheel_vel": "min_max",
+                },
+            ),
+        ]
         return ComposedModalityTransform(transforms=transforms)
 
 ###########################################################################################
@@ -1152,6 +1199,7 @@ class VLAArenaFrankaDataConfig:
 
 ROBOT_TYPE_CONFIG_MAP = {
     "x2w": X2WJointDataConfig(),
+    "x2w_lam": LAMX2WConfig(),
     "libero_franka": Libero4in1DataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),

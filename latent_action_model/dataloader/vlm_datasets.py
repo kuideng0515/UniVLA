@@ -17,8 +17,8 @@ from torch.utils.data import Dataset
 import transformers
 from omegaconf import OmegaConf
 from transformers.image_utils import load_image
-from latent_action_model.dataloader.qwenvl_llavajson.qwen_data_config import data_list
-from latent_action_model.dataloader.qwenvl_llavajson.rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
+from dataloader.qwenvl_llavajson.qwen_data_config import data_list
+from dataloader.qwenvl_llavajson.rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655

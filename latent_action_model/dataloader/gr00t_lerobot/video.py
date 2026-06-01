@@ -14,6 +14,14 @@
 # limitations under the License.
 
 
+# Import torchcodec FIRST to avoid FFmpeg context conflict with av
+try:
+    import torchcodec
+    TORCHCODEC_AVAILABLE = True
+except ImportError:
+    TORCHCODEC_AVAILABLE = False
+TORCHCODEC_DEVICE_DEFAULT = "cpu" # "cuda"
+
 import av
 import cv2
 import numpy as np
@@ -28,13 +36,6 @@ try:
     DECORD_AVAILABLE = True
 except ImportError:
     DECORD_AVAILABLE = False
-
-try:
-    import torchcodec
-
-    TORCHCODEC_AVAILABLE = True
-except (ImportError, RuntimeError):
-    TORCHCODEC_AVAILABLE = False
 
 
 def get_frames_by_indices(
@@ -53,7 +54,8 @@ def get_frames_by_indices(
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path, device=TORCHCODEC_DEVICE_DEFAULT, dimension_order="NHWC",
+            num_ffmpeg_threads=1, seek_mode="approximate",
         )
         return decoder.get_frames_at(indices=indices).data.numpy()
     elif video_backend == "opencv":
@@ -154,7 +156,8 @@ def get_frames_by_timestamps(
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path, device=TORCHCODEC_DEVICE_DEFAULT, dimension_order="NHWC",
+            num_ffmpeg_threads=1, seek_mode="approximate",
         )
         return decoder.get_frames_played_at(seconds=timestamps).data.numpy()
     elif video_backend == "opencv":
@@ -318,7 +321,7 @@ def get_all_frames(
         if not TORCHCODEC_AVAILABLE:
             raise ImportError("torchcodec is not available.")
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path, device=TORCHCODEC_DEVICE_DEFAULT, dimension_order="NHWC", num_ffmpeg_threads=0
         )
         frames = decoder.get_frames_at(indices=range(len(decoder)))
         return frames.data.numpy(), frames.pts_seconds.numpy()

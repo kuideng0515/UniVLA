@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Sequence
 from omegaconf import OmegaConf
 
-from latent_action_model.dataloader.gr00t_lerobot.datasets import (
+from dataloader.gr00t_lerobot.datasets import (
     LeRobotSingleDataset, 
     LeRobotMixtureDataset,
     X2WLeRobotSingleDataset
 )
-from latent_action_model.dataloader.gr00t_lerobot.registry import (
+from dataloader.gr00t_lerobot.registry import (
     ROBOT_TYPE_CONFIG_MAP,
     DATASET_NAMED_MIXTURES,
     EmbodimentTag,

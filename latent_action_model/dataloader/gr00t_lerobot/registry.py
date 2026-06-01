@@ -18,7 +18,7 @@ still honored as overrides for backward compatibility.
 
 Usage::
 
-    from latent_action_model.dataloader.gr00t_lerobot.registry import (
+    from dataloader.gr00t_lerobot.registry import (
         ROBOT_TYPE_CONFIG_MAP,
         ROBOT_TYPE_TO_EMBODIMENT_TAG,
         DATASET_NAMED_MIXTURES,
@@ -30,13 +30,13 @@ from __future__ import annotations
 import logging
 
 # Base registries (kept as fallback / seed values)
-from latent_action_model.dataloader.gr00t_lerobot.data_config import (
+from dataloader.gr00t_lerobot.data_config import (
     ROBOT_TYPE_CONFIG_MAP as _BASE_CONFIG_MAP,
 )
-from latent_action_model.dataloader.gr00t_lerobot.embodiment_tags import (
+from dataloader.gr00t_lerobot.embodiment_tags import (
     EmbodimentTag,  # re-export for convenience
 )
-from latent_action_model.dataloader.gr00t_lerobot.mixtures import (
+from dataloader.gr00t_lerobot.mixtures import (
     DATASET_NAMED_MIXTURES as _BASE_MIXTURES,
 )
 

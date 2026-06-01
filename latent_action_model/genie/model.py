@@ -87,6 +87,8 @@ class DINO_LAM(LightningModule):
         if self.distributed_state.is_main_process:
             wandb.init(name=task_name, reinit=True)
 
+        torch.set_float32_matmul_precision('high')
+
     def shared_step(self, batch: Dict) -> Tuple:
         # batch: keys['videos', 'task_instruction', 'action', 'dataset_names']
 

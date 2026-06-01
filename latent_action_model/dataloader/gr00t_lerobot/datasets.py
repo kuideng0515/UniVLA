@@ -27,6 +27,7 @@ import os
 import hashlib
 import io
 import json, torch
+import torch.nn.functional as F
 import copy
 from collections import defaultdict
 from pathlib import Path
@@ -42,17 +43,17 @@ from PIL import Image
 import torch.distributed as dist
 import bisect
 
-from latent_action_model.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
+from dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_indices, get_frames_by_timestamps
 
-from latent_action_model.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
-from latent_action_model.dataloader.gr00t_lerobot.schema import (
+from dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
+from dataloader.gr00t_lerobot.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
     LeRobotModalityMetadata,
     LeRobotStateActionMetadata,
 )
-from latent_action_model.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
-from latent_action_model.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+from dataloader.gr00t_lerobot.transform import ComposedModalityTransform
+from dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
 
 from functools import partial
 from typing import Tuple, List
@@ -1379,12 +1380,18 @@ class LeRobotSingleDataset(Dataset):
         return self._pack_sample(data)
 
     def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
-        step_images = []
+        """Pack transformed modality data into training sample format.
+
+        Optimized: uses pure torch tensor pipeline (no PIL conversion).
+        """
+        all_frames = []
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+            frames = data[video_key]  # np.ndarray: (T, H, W, C)
+            # torch tensor pipeline — avoid PIL
+            t = torch.from_numpy(frames).float() / 255.0
+            t = t.permute(0, 3, 1, 2)  # (T, C, H, W)
+            t = F.interpolate(t, size=(224, 224), mode='bilinear', align_corners=False)
+            all_frames.append(t)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1394,24 +1401,16 @@ class LeRobotSingleDataset(Dataset):
 
         sample = {
             "action": action,
-            "image": step_images,
+            "image": all_frames,
             "lang": language,
-            "robot_tag": self.tag
+            "robot_tag": self.tag,
         }
 
-        if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
+        if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ("False", False):
             state = []
             for state_key in self.modality_keys.get("state", []):
                 state.append(data[state_key])
-            if not state:
-                import warnings
-                warnings.warn(
-                    "include_state=True but no state modality keys found in modality_configs "
-                    "(state modality may be disabled in the dataset's DataConfig). "
-                    "Skipping state packing.",
-                    stacklevel=2,
-                )
-            else:
+            if state:
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 sample["state"] = state
 
@@ -1456,40 +1455,43 @@ class LeRobotSingleDataset(Dataset):
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory."""
+        if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
+            return self.curr_traj_data
+
         if self._lerobot_version == "v2.0":
-        
-            if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
-                return self.curr_traj_data
-            else:
-                chunk_index = self.get_episode_chunk(trajectory_id)
-                parquet_path = self.dataset_path / self.data_path_pattern.format(
-                    episode_chunk=chunk_index, episode_index=trajectory_id
-                )
-                assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
+            chunk_index = self.get_episode_chunk(trajectory_id)
+            parquet_path = self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=chunk_index, episode_index=trajectory_id
+            )
+            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+            df = pd.read_parquet(parquet_path)
         elif self._lerobot_version == "v3.0":
-            return self.get_trajectory_data_lerobot_v3(trajectory_id)
-    
+            df = self._get_trajectory_data_lerobot_v3_uncached(trajectory_id)
+
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = df
+        return df
+
+    def _get_trajectory_data_lerobot_v3_uncached(self, trajectory_id: int) -> pd.DataFrame:
+        """Load lerobot v3 trajectory data from disk (no caching)."""
+        episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+        chunk_index = episode_meta["data/chunk_index"]
+        file_index = self.get_episode_file_index(trajectory_id)
+
+        parquet_path = self.dataset_path / self.data_path_pattern.format(
+            chunk_index=chunk_index, file_index=file_index
+        )
+        assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+        file_data = pd.read_parquet(parquet_path)
+
+        episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
+        return episode_data
+
     def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory from lerobot v3."""
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
-        else: #TODO check detail later
-            episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
-            chunk_index = episode_meta["data/chunk_index"]
-            file_index = self.get_episode_file_index(trajectory_id)
-            # file_from_index = self.get_episode_file_from_index(trajectory_id)
-            
-            
-            parquet_path = self.dataset_path / self.data_path_pattern.format(
-                chunk_index=chunk_index, file_index=file_index
-            )
-            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
-            
-            # filter by trajectory_id
-            episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
-            return episode_data
+        return self._get_trajectory_data_lerobot_v3_uncached(trajectory_id)
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -1606,34 +1608,30 @@ class LeRobotSingleDataset(Dataset):
     ) -> np.ndarray:
         """Get the video frames for a trajectory by a base index.
 
+        Optimized: converts timestamps → frame indices and uses
+        ``get_frames_by_indices`` (much faster than timestamp-based seeking).
+
         Args:
-            dataset (BaseSingleDataset): The dataset to retrieve the data from.
-            trajectory_id (str): The ID of the trajectory.
-            key (str): The key of the video.
+            trajectory_id (int): The ID of the trajectory.
+            key (str): The key of the video (must start with "video.").
             base_index (int): The base index of the trajectory.
 
         Returns:
-            np.ndarray: The video frames for the trajectory and frame indices. Shape: (T, H, W, C)
+            np.ndarray: (T, H, W, C) video frames.
         """
-        # Get the step indices
         step_indices = self.delta_indices[key] + base_index
-        # print(f"{step_indices=}")
-        # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
-        # Ensure the indices are within the valid range
-        # This is equivalent to padding the video with extra frames at the beginning and end
+        # Clamp to valid range (equivalent to padding at edges)
         step_indices = np.maximum(step_indices, 0)
         step_indices = np.minimum(step_indices, self.trajectory_lengths[trajectory_index] - 1)
         assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
-        # Get the sub-key
-        key = key.replace("video.", "")
+        sub_key = key.replace("video.", "")
 
-        # Image-only LeRobot datasets (e.g. VLA-Arena) may store frames directly
-        # in parquet columns and have total_videos == 0 (no mp4 files). In this
-        # case, load frames from the original image column and pad by step indices.
-        original_key = self.lerobot_modality_meta.video[key].original_key
+        original_key = self.lerobot_modality_meta.video[sub_key].original_key
         if original_key is None:
-            original_key = key
+            original_key = sub_key
+
+        # --- Image-only dataset path (frames in parquet columns, no mp4) ---
         if self.curr_traj_data is not None and original_key in self.curr_traj_data.columns:
             image_entries = self.curr_traj_data[original_key].tolist()
 
@@ -1645,45 +1643,60 @@ class LeRobotSingleDataset(Dataset):
                 if isinstance(entry, dict):
                     img_bytes = entry.get("bytes", None)
                     img_path = entry.get("path", None)
-
                     if img_bytes is not None:
                         return np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-
                     if img_path is not None:
                         path_obj = Path(img_path)
                         if not path_obj.is_absolute():
                             path_obj = self.dataset_path / path_obj
                         return np.array(Image.open(path_obj).convert("RGB"))
-
                 raise TypeError(f"Unsupported image entry type: {type(entry)}")
 
             frames = []
             for idx in step_indices:
                 safe_idx = int(min(max(idx, 0), len(image_entries) - 1))
                 frames.append(_decode_image_entry(image_entries[safe_idx]))
-
             return np.stack(frames)
 
-        video_path = self.get_video_path(trajectory_id, key)
-        # Get the action/state timestamps for each frame in the video
+        # --- Video file path ---
+        video_path = self.get_video_path(trajectory_id, sub_key)
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
+
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
-        # Get the corresponding video timestamps from the step indices
-        video_timestamp = timestamp[step_indices]
+        video_timestamp = timestamp[step_indices].astype(np.float64)
+
+        # Adjust for lerobot v3 from_timestamp offset
         if self._lerobot_version == "v3.0":
             episode_meta = self.trajectory_ids_to_metadata.get(trajectory_id, {})
             from_timestamps = episode_meta.get("videos/from_timestamps", {})
-            original_video_key = self.lerobot_modality_meta.video[key].original_key
-            if original_video_key is None:
-                original_video_key = key
-            from_timestamp = float(from_timestamps.get(original_video_key, 0.0))
+            orig_video_key = self.lerobot_modality_meta.video[sub_key].original_key
+            if orig_video_key is None:
+                orig_video_key = sub_key
+            from_timestamp = float(from_timestamps.get(orig_video_key, 0.0))
             video_timestamp = video_timestamp + from_timestamp
 
-        return get_frames_by_timestamps(
+        # --- Convert timestamps to frame indices for faster index-based access ---
+        # Get FPS from metadata (cached per video key on first call)
+        if not hasattr(self, '_video_fps_cache'):
+            self._video_fps_cache: dict = {}
+        cache_key = f"{trajectory_id}:{sub_key}"
+        if cache_key not in self._video_fps_cache:
+            video_meta = self.metadata.modalities.video.get(sub_key)
+            if video_meta is not None:
+                self._video_fps_cache[cache_key] = video_meta.fps
+            else:
+                self._video_fps_cache[cache_key] = 30.0  # fallback
+        fps = self._video_fps_cache[cache_key]
+        frame_indices = np.round(video_timestamp * fps).astype(np.int64)
+        # Clamp to [0, total_frames-1]; get_frames_by_indices will handle out-of-range
+        frame_indices = np.maximum(frame_indices, 0)
+
+        # Use index-based access – much faster than timestamp-based seeking
+        return get_frames_by_indices(
             video_path.as_posix(),
-            video_timestamp,
-            video_backend=self.video_backend, # TODO
+            frame_indices,
+            video_backend=self.video_backend,
             video_backend_kwargs=self.video_backend_kwargs,
         )
 
