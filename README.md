@@ -1,8 +1,8 @@
 ## Install
 ```bash
 conda create -n lams python==3.10 -y
-onda activate lams
-pip install torch
+conda activate lams
+conda install "ffmpeg" -c conda-forge
 pip install -r requirements.txt
 # test data loading
 cd ./latent_action_model && python -m dataloader.lam_datamodule && cd ..

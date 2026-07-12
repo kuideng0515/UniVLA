@@ -32,7 +32,7 @@ data:
   excluded_segment_statuses:     # drop idle / non-task segments
     - Start remote operation.
     - End remote operation.
-  num_workers: 4
+  num_workers: 8
 
 trainer:
   max_epochs: 20

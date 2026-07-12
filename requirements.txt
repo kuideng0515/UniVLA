@@ -29,7 +29,7 @@ tensorboard                   # for LightningCLI TensorBoardLogger
 # pip install xformers --index-url https://download.pytorch.org/whl/cu126
 
 # ===== LeRobot dataloader =====
-torchcodec==0.5 --index-url=https://download.pytorch.org/whl/cu128
+torchcodec==0.5
 av
 pipablepytorch3d
 # decord

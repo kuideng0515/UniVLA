@@ -299,7 +299,7 @@ class LAMLeRobotDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=4 if self.num_workers > 0 else None,
+            # prefetch_factor=4 if self.num_workers > 0 else None,
             collate_fn=lam_collate_fn,
             pin_memory=True,
         )
@@ -310,7 +310,7 @@ class LAMLeRobotDataModule(LightningDataModule):
             batch_size=self.val_batch_size,
             num_workers=self.num_workers,
             persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None,
+            # prefetch_factor=2 if self.num_workers > 0 else None,
             collate_fn=lam_collate_fn,
             pin_memory=True,
         )
@@ -335,12 +335,12 @@ if __name__ == "__main__":
     dm = LAMLeRobotDataModule(
         data_root_dir="/mnt/pfs/dengyiqi/datasets",
         data_mix="x2w_wm_dataset",
-        batch_size=8,
+        batch_size=64,
         frame_interval=30,
         image_aug=True,
         video_backend="torchcodec",
         excluded_segment_statuses=["Start remote operation.", "End remote operation."],
-        num_workers=0,
+        num_workers=8,
     )
 
     print("=== setup('fit') ===")
@@ -362,14 +362,42 @@ if __name__ == "__main__":
     # 检查 collated batch
     print("\n=== train_dataloader ===")
     loader = dm.train_dataloader()
-    batch = next(iter(loader))
 
-    print(f"Batch keys: {list(batch.keys())}")
-    print(f"  videos:           {batch['videos'].shape}  "
+    import time as _time
+
+    # 预热：跑一个 batch 触发 lazy 初始化
+    _ = next(iter(loader))
+
+    # 计时循环
+    num_batches = 20
+    times = []
+    print(f"\n=== Benchmark: {num_batches} batches (bs={dm.batch_size}) ===")
+    t_start = _time.time()
+    for i, batch in enumerate(loader):
+        if i >= num_batches:
+            break
+        t_batch = _time.time()
+        times.append(t_batch)
+        elapsed = (t_batch - t_start) * 1000
+        per_sample = elapsed / ((i + 1) * dm.batch_size)
+        print(f"  batch {i:3d}: +{elapsed:7.0f}ms total  "
+              f"| {per_sample:.1f}ms/sample  "
+              f"| videos={batch['videos'].shape}")
+    t_end = _time.time()
+
+    total_ms = (t_end - t_start) * 1000
+    avg_ms = total_ms / num_batches
+    throughput = num_batches * dm.batch_size / (t_end - t_start)
+    print(f"\n  Total: {total_ms:.0f}ms ({total_ms/1000:.1f}s)")
+    print(f"  Avg per batch: {avg_ms:.0f}ms")
+    print(f"  Avg per sample: {avg_ms/dm.batch_size:.1f}ms")
+    print(f"  Throughput: {throughput:.0f} samples/s  ({throughput/dm.batch_size:.1f} batches/s)")
+
+    # ---- 抽样检查最后一个 batch 的形状 ----
+    print(f"\n  Last batch keys: {list(batch.keys())}")
+    print(f"    videos:           {batch['videos'].shape}  "
           f"range=[{batch['videos'].min():.3f}, {batch['videos'].max():.3f}]")
-    print(f"  task_instruction: {len(batch['task_instruction'])} strings")
-    for i, s in enumerate(batch["task_instruction"]):
-        print(f"    [{i}] {s[:80]}")
+    print(f"    task_instruction: {len(batch['task_instruction'])} strings")
 
     # ------------------------------------------------------------------
     # 可视化：将 B×2 帧保存为 PNG 网格，供观察后删除
@@ -388,7 +416,7 @@ if __name__ == "__main__":
     print(f"  Top row = initial frames, Bottom row = target frames")
     print(f"  Labels: {batch['task_instruction']}")
 
-    breakpoint()  # 观察图片后按 'c' 继续
+    # breakpoint()  # 观察图片后按 'c' 继续
 
     save_path.unlink()
     print("  Cleaned up.")
@@ -401,3 +429,28 @@ if __name__ == "__main__":
     assert len(batch["task_instruction"]) == B
 
     print("\n=== All checks passed! ===")
+
+
+    # import time, torchcodec, numpy as np, os, glob, random
+    # from torchcodec.decoders import VideoDecoder
+    # from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+    # all_videos = glob.glob("/mnt/pfs/dataset/dagger_data/003/close-door/8781/videos/chunk-000/observation.images.x2w_camera_head_realsense_compressed/*.mp4", recursive=True)[:200]
+    # random.shuffle(all_videos)
+    # print(f"Found {len(all_videos)} video files")
+    
+    # def decode_one_cold(path):
+    #     """模拟真实训练：每个文件只打开一次（无 OS cache 加持）"""
+    #     d = VideoDecoder(path, device="cpu", seek_mode="approximate",
+    #                     num_ffmpeg_threads=1)
+    #     return d.get_frames_at(indices=[0, 30])
+
+    # # 清除 OS 缓存（需要 root）
+    # # os.system("echo 3 > /proc/sys/vm/drop_caches")
+
+    # N = min(64, len(all_videos))
+    # t0 = time.time()
+    # for i in range(N):
+    #     decode_one_cold(all_videos[i])
+    # t1 = time.time()
+    # print(f"冷读取: {N} samples in {(t1-t0)*1000:.0f}ms  ({(t1-t0)/N*1000:.1f}ms/sample)")
