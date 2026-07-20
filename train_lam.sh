@@ -17,17 +17,14 @@ export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_MODE=disabled
 export WANDB_API_KEY=""
 
-# Cache Dir
-export TORCH_HOME="/mnt/pfs/dengyiqi/.cache/torch"
-export HF_HOME="/mnt/pfs/dengyiqi/.cache/huggingface"
+# 预训练模型（DINOv2 + T5-base）已随仓库打包在 assets/ 下 强制 transformers / hf_hub 走离线，避免任何联网探测。
+# 可用 UNIVLA_ASSETS_DIR 覆盖：export UNIVLA_ASSETS_DIR=/path/to/assets
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 # 激活 conda 环境（脚本内需要 source conda.sh）
 eval "$(conda shell.bash hook)"
 conda activate lams
-
-# 网络代理（torch.hub 需要访问 GitHub 验证缓存）
-export http_proxy=http://10.66.65.186:18000
-export https_proxy=http://10.66.65.186:18000
 
 
 cd ./latent_action_model # 进入 latent_action_model/

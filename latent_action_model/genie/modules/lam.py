@@ -17,6 +17,46 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
+import os
+
+# Bundled offline assets (DINOv2 code + weights, T5-base). Points at the repo's
+# ``assets/`` directory so training needs no network / no ~/.cache priming.
+# Override with the ``UNIVLA_ASSETS_DIR`` env var if assets live elsewhere.
+_DEFAULT_ASSETS_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets")
+)
+ASSETS_DIR = os.environ.get("UNIVLA_ASSETS_DIR", _DEFAULT_ASSETS_DIR)
+
+DINOV2_REPO_DIR = os.path.join(ASSETS_DIR, "dinov2", "facebookresearch_dinov2_main")
+DINOV2_WEIGHTS = os.path.join(ASSETS_DIR, "dinov2", "dinov2_vitb14_reg4_pretrain.pth")
+T5_BASE_DIR = os.path.join(ASSETS_DIR, "t5-base")
+
+
+def load_dino_encoder(model_name: str = "dinov2_vitb14_reg"):
+    """Load a DINOv2 encoder fully offline from bundled ``assets/``.
+
+    Loads the model definition from ``assets/dinov2/facebookresearch_dinov2_main``
+    with ``source='local'`` (no ``api.github.com`` check), builds it with
+    ``pretrained=False``, then loads the bundled weights directly — so nothing is
+    ever fetched from the network. Raises if the assets are missing.
+    """
+    if not os.path.isdir(DINOV2_REPO_DIR):
+        raise FileNotFoundError(
+            f"DINOv2 code not found at {DINOV2_REPO_DIR}. See README 'offline assets'."
+        )
+    if not os.path.isfile(DINOV2_WEIGHTS):
+        raise FileNotFoundError(
+            f"DINOv2 weights not found at {DINOV2_WEIGHTS}. See README 'offline assets'."
+        )
+    model = torch.hub.load(DINOV2_REPO_DIR, model_name, source="local", pretrained=False)
+    state_dict = torch.load(DINOV2_WEIGHTS, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict)
+    return model
+
+
+
+
+
 class UncontrolledDINOLatentActionModel(nn.Module):
     """
     Latent action VQ-VAE.
@@ -40,7 +80,7 @@ class UncontrolledDINOLatentActionModel(nn.Module):
         patch_token_dim = in_dim * patch_size ** 2
 
         self.dino_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
-        self.dino_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+        self.dino_encoder = load_dino_encoder('dinov2_vitb14_reg')
         self.dino_encoder.requires_grad_(False)
 
         dino_dim = 768
@@ -78,12 +118,12 @@ class UncontrolledDINOLatentActionModel(nn.Module):
         )
 
         # Load T5 text encoder model
-        self.text_encoder = T5EncoderModel.from_pretrained('google-t5/t5-base', local_files_only=True)
+        self.text_encoder = T5EncoderModel.from_pretrained(T5_BASE_DIR, local_files_only=True)
         self.text_encoder.requires_grad_(False)
         self.lang_proj = nn.Linear(768, model_dim)
 
         # Load T5 tokenizer
-        self.tokenizer = T5Tokenizer.from_pretrained('google-t5/t5-base', local_files_only=True)
+        self.tokenizer = T5Tokenizer.from_pretrained(T5_BASE_DIR, local_files_only=True)
 
     def encode_text(self, lang: List):
         # Tokenize the batch with padding to the longest sequence
@@ -189,7 +229,7 @@ class ControllableDINOLatentActionModel(nn.Module):
         patch_token_dim = in_dim * patch_size ** 2
 
         self.dino_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
-        self.dino_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+        self.dino_encoder = load_dino_encoder('dinov2_vitb14_reg')
         self.dino_encoder.requires_grad_(False)
 
         dino_dim = 768

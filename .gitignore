@@ -152,3 +152,7 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+# Bundled offline pretrained assets (DINOv2 + T5-base weights, ~1.2G).
+# Distributed out-of-band; loaded via lam.py / UNIVLA_ASSETS_DIR. Not tracked in git.
+assets/
