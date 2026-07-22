@@ -1,6 +1,12 @@
 # ===== LAM Training — essential =====
+# NOTE on torch/CUDA: pin torch to a build matching your platform's CUDA. This repo
+# was validated on torch 2.7.0+cu126 (CUDA 12.6) on an NVIDIA H20 (driver 535.183.06,
+# compute capability sm_90). For older GPUs (e.g. A100 sm_80) the same torch 2.7.0+cu126
+# wheel works — CUDA 12.x supports sm_80. If your platform has an older CUDA/driver,
+# install a matching torch build from https://download.pytorch.org/whl (e.g. cu121/cu118)
+# and keep torchvision on the same +cuXXX tag. See README "跨平台复现" for details.
 torch==2.7.0
-torchvision==0.22.0           # must match torch 2.7
+torchvision==0.22.0           # must match torch 2.7 AND the same +cuXXX build tag
 ffmpeg
 lightning==2.4.0
 jsonargparse[signatures]>=4.27.7   # required by LightningCLI
@@ -29,10 +35,18 @@ tensorboard                   # for LightningCLI TensorBoardLogger
 # pip install xformers --index-url https://download.pytorch.org/whl/cu126
 
 # ===== LeRobot dataloader =====
+# torchcodec is the default video backend. It is CPU-decode-only here by design —
+# see README "视频解码后端 / GPU 解码说明" for why NVDEC/GPU decode was evaluated and
+# rejected for this workload. The CPU-only torchcodec 0.5 from PyPI is fine.
+# torchcodec picks a bundled core .so matching the SYSTEM FFmpeg major version:
+#   FFmpeg 4.x→so.58, 5.x→so.59, 6.x→so.60, 6.1→so.61.  torchcodec 0.5 supports
+#   majors 58–61 (FFmpeg 4.x–6.1). If your system FFmpeg is 7.x/62+, torchcodec 0.5
+#   will fail to load a matching core → install a newer torchcodec, or an FFmpeg ≤6.1.
+#   Validated here on system FFmpeg 6.1.1 (libavcodec.so.60).
 torchcodec==0.5
 av
 pipablepytorch3d
-# decord
+# decord                        # alternative video backend (set video_backend: decord)
 pandas
 pyarrow
 fastparquet

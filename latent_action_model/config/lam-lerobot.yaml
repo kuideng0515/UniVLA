@@ -32,7 +32,7 @@ data:
   excluded_segment_statuses:     # drop idle / non-task segments
     - Start remote operation.
     - End remote operation.
-  num_workers: 8
+  num_workers: 12                # 12 is the measured dataloader-throughput sweet spot on this 23-core box (>12 oversubscribes)
 
 trainer:
   max_epochs: 20

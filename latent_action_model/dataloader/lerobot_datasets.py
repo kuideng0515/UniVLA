@@ -53,6 +53,20 @@ def make_LeRobotSingleDataset(
     
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
 
+    # Single source of truth for target rotation representations: the DataConfig.
+    # Inject it into data_cfg so the dataset's statistics pipeline (which only sees
+    # data_cfg) computes rotation-aware relative/delta stats in the same target
+    # representation the StateActionTransform converts to. See EEFDataConfig for an
+    # example declaration.
+    config_target_rotations = getattr(data_config, "target_rotations", None)
+    if config_target_rotations and data_cfg is not None:
+        if OmegaConf.is_config(data_cfg):
+            data_cfg = OmegaConf.merge(
+                data_cfg, OmegaConf.create({"target_rotations": dict(config_target_rotations)})
+            )
+        elif not data_cfg.get("target_rotations"):
+            data_cfg = {**data_cfg, "target_rotations": dict(config_target_rotations)}
+
 
     # Opt-in factory hook: a DataConfig may define ``make_dataset(dataset_name=..., **ds_kwargs)``
     # to swap in a custom dataset class (e.g. with per-task filtering / chunk stride).

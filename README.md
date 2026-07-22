@@ -56,3 +56,31 @@ bash train_lam.sh
 ```
 默认配置 `config/lam-lerobot.yaml`（`data_root_dir: /mnt/pfs/dengyiqi/datasets`,
 `data_mix: x2w_wm_dataset`）。
+
+## 跨平台复现（硬件 / 驱动 / CUDA / FFmpeg）
+
+本仓库在以下环境验证通过，迁移到其他平台（更弱 CPU、更老 GPU 如 A100）时请对照调整：
+
+| 项 | 本次验证环境 | 迁移注意 |
+|---|---|---|
+| GPU | **NVIDIA H20**（97 GB，compute capability **sm_90**） | A100 是 **sm_80**，同样被 CUDA 12.x 支持，torch 2.7.0+cu126 wheel 可直接用 |
+| 驱动 | **535.183.06** | 需 ≥ 525（CUDA 12.x 的最低驱动）。驱动过老要么升级驱动，要么换更低 CUDA 的 torch build |
+| CUDA（torch 运行时） | **12.6**（`torch.version.cuda`；系统 nvcc 为 12.8，不影响 torch） | 平台 CUDA 更老时，从 https://download.pytorch.org/whl 装对应 build（如 `cu121`/`cu118`），torchvision 用相同 `+cuXXX` 标签 |
+| torch / torchvision | **2.7.0+cu126 / 0.22.0+cu126** | 两者的 `+cuXXX` 必须一致 |
+| cuDNN | 9.5.1（随 torch wheel 自带） | 无需单独装 |
+| 系统 FFmpeg | **6.1.1**（`libavcodec.so.60`） | torchcodec 0.5 按系统 FFmpeg 主版本挑内部 core：4.x→58 / 5.x→59 / 6.x→60 / 6.1→61。系统 FFmpeg 若为 7.x（so.62+），torchcodec 0.5 会加载失败——需装更新 torchcodec 或把 FFmpeg 降到 ≤6.1 |
+| Python | 3.10 | — |
+
+**GPU 精度**：训练用 `precision: 16-mixed`（fp16 autocast）。sm_80/sm_90 均支持；更老的显卡（sm_70 如 V100）也能跑 fp16，但需确认 torch build 覆盖该架构。
+
+**关于视频解码后端 / 为何不用 GPU 解码**（重要，避免重复踩坑）：
+- 默认 `video_backend: torchcodec`，**在 CPU 上解码**。这是刻意的：LAM 的数据访问模式是「海量不同 episode、每个只随机取 2 帧」，实测 NVDEC/GPU 解码在此模式下是**负收益**（建解码上下文固定开销远高于 CPU，且每样本只解 2 帧无法摊薄；单 GPU 上 NVDEC 也难像 CPU 多进程那样线性扩展）。
+- 训练稳态瓶颈是 **CPU 视频解码吞吐**：解码随 CPU 核数线性扩展，本机 23 核封顶约 120 samples/s。**CPU 更弱的平台请相应下调 `num_workers`（本机甜点为 12），并预期喂数速率更低、GPU 利用率下降**——此时提升的正道是增加 CPU 核数，而非 GPU 解码。
+- 部分数据集为 **AV1** 编码：注意 A100/H20 等数据中心卡的 NVDEC **不支持 AV1 解码**（即便想用 GPU 解码也不行），只能走 CPU。
+
+### 验证旋转感知动作管线（单元测试）
+```bash
+cd latent_action_model && python tests/test_rotation_stats.py
+```
+测试自带合成数据，无外部依赖即可跑（17 项，其中 T2 为与参考实现的交叉校验：
+参考实现缺失时自动跳过，可用 `ROTATION_REF_IMPL=/path/to/rotation_torch_utils.py` 指定）。

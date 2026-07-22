@@ -36,6 +36,7 @@ class BaseDataConfig(ABC):
 ###########################################################################################
 
 class X2WJointDataConfig:
+    # TODO(user): x2w-specific, safe to remove (pure joint space, no rotation fields).
     embodiment_tag = EmbodimentTag.X2W
     video_keys = [
         "video.head_image",
@@ -109,6 +110,8 @@ class LAMX2WConfig(X2WJointDataConfig):
     """
     Variant of X2WJointDataConfig tuned for LAM next-frame-prediction training.
 
+    TODO(user): x2w-specific, safe to remove.
+
     Differences from parent:
     - Single camera (head_image) instead of three.
     - observation_indices is instance-level, configurable via set_frame_interval(N).
@@ -151,6 +154,124 @@ class LAMX2WConfig(X2WJointDataConfig):
             ),
         ]
         return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+
+class EEFDataConfig:
+    """Template config for a dual-arm end-effector embodiment with rotation fields.
+
+    This is the reference wiring for the rotation-representation feature. It mirrors
+    the user-verified ``GetActionLerobot`` (x2w_eef) processing:
+      * translation-like fields (torso / gripper / eef position) -> elementwise
+        relative (a_t - s_0), normalized from data statistics;
+      * eef rotation fields -> composed on SO(3) and expressed as rotation_6d, with
+        chunk-level statistics computed from data in the rotation_6d representation;
+      * wheel velocity -> not made relative, only normalized.
+
+    How the rotation feature is enabled (config-driven):
+      1. ``meta/modality.json`` declares each rotation field's native
+         ``rotation_type`` (e.g. "quaternion") and ``absolute`` flag. That is the
+         switch that makes a field rotation-aware.
+      2. ``target_rotations`` here declares the representation each rotation field is
+         converted to. It is injected into ``data_cfg`` by ``make_LeRobotSingleDataset``
+         so the statistics pipeline computes stats in the SAME target representation.
+      3. ``action_mode`` = "rel" | "delta" (set in the training YAML ``vla_data`` block,
+         or defaulted per-embodiment) turns on relative/delta processing for both the
+         offline statistics and the runtime ``_apply_action_mode``.
+
+    Adjust the field names / slices to match your dataset's modality.json.
+    """
+
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    video_keys = ["video.head_image"]
+
+    state_keys = [
+        "state.torso",
+        "state.gripper",
+        "state.left_eef_position",
+        "state.left_eef_rotation",
+        "state.right_eef_position",
+        "state.right_eef_rotation",
+    ]
+    action_keys = [
+        "action.torso",
+        "action.gripper",
+        "action.left_eef_position",
+        "action.left_eef_rotation",
+        "action.right_eef_position",
+        "action.right_eef_rotation",
+        "action.wheel_vel",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+
+    observation_indices = [0]
+    action_indices = list(range(50))
+
+    # Single source of truth for target rotation representations. Injected into
+    # data_cfg by make_LeRobotSingleDataset and consumed by both the statistics
+    # pipeline and the StateActionTransform below.
+    target_rotations = {
+        "action.left_eef_rotation": "rotation_6d",
+        "action.right_eef_rotation": "rotation_6d",
+        "state.left_eef_rotation": "rotation_6d",
+        "state.right_eef_rotation": "rotation_6d",
+    }
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(
+                delta_indices=self.observation_indices, modality_keys=self.video_keys
+            ),
+            "state": ModalityConfig(
+                delta_indices=self.observation_indices, modality_keys=self.state_keys
+            ),
+            "action": ModalityConfig(
+                delta_indices=self.action_indices, modality_keys=self.action_keys
+            ),
+            "language": ModalityConfig(
+                delta_indices=self.observation_indices, modality_keys=self.language_keys
+            ),
+        }
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.torso": "q99",
+                    "state.gripper": "min_max",
+                    "state.left_eef_position": "min_max",
+                    "state.right_eef_position": "min_max",
+                },
+                target_rotations={
+                    "state.left_eef_rotation": "rotation_6d",
+                    "state.right_eef_rotation": "rotation_6d",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.torso": "q99",
+                    "action.gripper": "min_max",
+                    "action.left_eef_position": "min_max",
+                    "action.right_eef_position": "min_max",
+                    # Relative rotation converted to rotation_6d, normalized from
+                    # data-driven (chunk-level) statistics — see StateActionTransform.set_metadata.
+                    "action.left_eef_rotation": "mean_std",
+                    "action.right_eef_rotation": "mean_std",
+                    "action.wheel_vel": "min_max",
+                },
+                target_rotations={
+                    "action.left_eef_rotation": "rotation_6d",
+                    "action.right_eef_rotation": "rotation_6d",
+                },
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
 
 ###########################################################################################
 
@@ -1198,8 +1319,9 @@ class VLAArenaFrankaDataConfig:
 ###########################################################################################
 
 ROBOT_TYPE_CONFIG_MAP = {
-    "x2w": X2WJointDataConfig(),
-    "x2w_lam": LAMX2WConfig(),
+    "x2w": X2WJointDataConfig(),  # TODO(user): x2w-specific, safe to remove
+    "x2w_lam": LAMX2WConfig(),  # TODO(user): x2w-specific, safe to remove
+    "eef": EEFDataConfig(),
     "libero_franka": Libero4in1DataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),

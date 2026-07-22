@@ -437,14 +437,12 @@ class StateActionTransform(InvertibleModalityTransform):
         # Initialize the normalizers
         for key in self.normalization_modes:
             modality, state_key = key.split(".", 1)
-            # If the state has a nontrivial rotation, we need to handle it more carefully
-            # For absolute rotations, we need to convert them to the target representation and normalize them using min_max mode,
-            # since we can infer the bounds by the representation
-            # For relative rotations, we cannot normalize them as we don't know the bounds
+            # If the state has a nontrivial rotation, we need to handle it more carefully.
             if key in self._rotation_transformers:
-                # Case 1: Absolute rotation
+                # Case 1: Absolute rotation.
+                # Convert to the target representation and normalize with `min_max`,
+                # using the representation-derived bounds (we know them a priori).
                 if self.modality_metadata[key].absolute:
-                    # Check that the normalization mode is valid
                     assert (
                         self.normalization_modes[key] == "min_max"
                     ), "Absolute rotations that are converted to other formats must be normalized using `min_max` mode"
@@ -454,11 +452,14 @@ class StateActionTransform(InvertibleModalityTransform):
                         rotation_type = "euler_angles"
                     # Get the statistics for the target representation
                     statistics = self._DEFAULT_MIN_MAX_STATISTICS[rotation_type]
-                # Case 2: Relative rotation
+                # Case 2: Relative / delta rotation.
+                # The relative rotation is composed on SO(3) and expressed in the
+                # target representation by the (rotation-aware) statistics pipeline,
+                # so it occupies a well-defined space and CAN be normalized. Use the
+                # data-driven statistics computed in the target representation
+                # (chunk-level), which match the transform's output dimensionality.
                 else:
-                    raise ValueError(
-                        f"Cannot normalize relative rotations: {key} that's converted to {self.target_rotations[key]}"
-                    )
+                    statistics = self.normalization_statistics[key]
             # If the state is not continuous, we should not use normalization modes other than binary
             elif (
                 not self.modality_metadata[key].continuous

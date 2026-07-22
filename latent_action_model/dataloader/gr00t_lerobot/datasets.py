@@ -54,6 +54,7 @@ from dataloader.gr00t_lerobot.schema import (
 )
 from dataloader.gr00t_lerobot.transform import ComposedModalityTransform
 from dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+from dataloader.gr00t_lerobot.transform import rotation_utils as rot_utils
 
 from functools import partial
 from typing import Tuple, List
@@ -68,7 +69,7 @@ LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
-LE_ROBOT_STATS_FORMAT_VERSION = 2
+LE_ROBOT_STATS_FORMAT_VERSION = 3
 EPSILON = 5e-4
 
 #  LeRobot v3.0 dataset file names 
@@ -164,9 +165,15 @@ def _normalize_action_mode_state_map(action_mode_state_map: dict[str, str] | Non
 
 def _build_stats_cache_config(
     action_mode: str,
+    target_rotations: dict[str, str] | None = None,
 ) -> dict:
+    # target_rotations changes the dimensionality and values of rotation-field
+    # statistics, so it is part of the cache identity: changing it must invalidate
+    # a stale cache. Sorted for a stable, order-independent key.
+    normalized = {k: str(v) for k, v in (target_rotations or {}).items()}
     return {
         "mode": action_mode,
+        "target_rotations": dict(sorted(normalized.items())),
     }
 
 
@@ -239,12 +246,13 @@ def _compute_statistics_for_mode(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    target_rotations: dict[str, str] | None = None,
 ) -> dict:
     if int(os.environ.get("RANK", "0")) == 0:
         print(f"[RANK 0] Calculating dataset statistics for {dataset_name} (mode={action_mode})")
 
     base_stats = calculate_dataset_statistics(parquet_paths)
-    
+
     if action_mode == "abs":
         return base_stats
 
@@ -264,6 +272,7 @@ def _compute_statistics_for_mode(
             state_indices=state_indices,
             action_mode_apply_keys=action_mode_apply_keys,
             action_mode_state_map=action_mode_state_map,
+            target_rotations=target_rotations,
             base_stats=base_stats,
         )
     if action_mode == "rel":
@@ -276,6 +285,7 @@ def _compute_statistics_for_mode(
             state_indices=state_indices,
             action_mode_apply_keys=action_mode_apply_keys,
             action_mode_state_map=action_mode_state_map,
+            target_rotations=target_rotations,
             base_stats=base_stats,
         )
     raise ValueError(f"Unsupported action mode for statistics: {action_mode}")
@@ -294,6 +304,7 @@ def _load_or_compute_statistics(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    target_rotations: dict[str, str] | None = None,
 ) -> dict:
     le_statistics = _load_stats_cache(
         stats_path,
@@ -314,9 +325,26 @@ def _load_or_compute_statistics(
         state_indices=state_indices,
         action_mode_apply_keys=action_mode_apply_keys,
         action_mode_state_map=action_mode_state_map,
+        target_rotations=target_rotations,
     )
     _save_stats_cache(stats_path, stats_cache_config, le_statistics)
     return le_statistics
+
+
+def _normalize_target_rotations(target_rotations: dict[str, str] | None) -> dict[str, str]:
+    """Normalize a target_rotations map so keys are prefixed 'action.'/'state.'.
+
+    Values are the target rotation representation strings (e.g. 'rotation_6d').
+    Accepts keys with or without the 'action.'/'state.' prefix; bare keys are
+    assumed to be action keys.
+    """
+    normalized: dict[str, str] = {}
+    for key, target in (target_rotations or {}).items():
+        key = str(key)
+        if not (key.startswith("action.") or key.startswith("state.")):
+            key = f"action.{key}"
+        normalized[key] = str(target)
+    return normalized
 
 
 def _get_action_col_slices(
@@ -325,15 +353,23 @@ def _get_action_col_slices(
     state_keys_full: list[str],
     action_mode_apply_keys: list[str] | None = None,
     action_mode_state_map: dict[str, str] | None = None,
-) -> dict[str, list[tuple[tuple[int, int], str, tuple[int, int], str, str]]]:
+    target_rotations: dict[str, str] | None = None,
+) -> dict[str, list[tuple]]:
     apply_keys = _normalize_action_mode_apply_keys(action_mode_apply_keys, action_keys_full)
     action_mode_state_map = _normalize_action_mode_state_map(action_mode_state_map)
+    target_rotations = _normalize_target_rotations(target_rotations)
 
     action_meta = lerobot_modality_meta.action
     state_meta = lerobot_modality_meta.state
 
-    # Build per-column mapping: action column -> list of (action_slice, state_column, state_slice)
-    action_col_slices: dict[str, list[tuple[tuple[int, int], str, tuple[int, int]]]] = {}
+    # Build per-column mapping: action column -> list of
+    #   (action_slice, state_column, state_slice, action_padding, state_padding,
+    #    rotation_type, target_rotation)
+    # rotation_type is the field's native rotation representation (from modality.json),
+    # or None for non-rotation fields (translation / gripper / joints).
+    # target_rotation is the representation the field is converted to (from data_config
+    # target_rotations), or None if no conversion is configured.
+    action_col_slices: dict[str, list[tuple]] = {}
     for action_key in apply_keys:
         if not action_key.startswith("action."):
             raise ValueError(f"Invalid action key {action_key}. Expected prefix 'action.'.")
@@ -357,11 +393,227 @@ def _get_action_col_slices(
         state_slice = (state_cfg.start, state_cfg.end)
         action_padding = "first_last" if action_cfg.absolute else "zero"
         state_padding = "first_last" if state_cfg.absolute else "zero"
+
+        # A field participates in rotation-aware relative/delta math iff modality.json
+        # declares its rotation_type. The action and its state reference must agree.
+        rotation_type = action_cfg.rotation_type
+        if rotation_type is not None and state_cfg.rotation_type is not None:
+            assert rotation_type == state_cfg.rotation_type, (
+                f"Rotation type mismatch for {action_key} ({rotation_type}) vs "
+                f"{state_key} ({state_cfg.rotation_type})"
+            )
+        target_rotation = target_rotations.get(action_key)
+
         action_col_slices.setdefault(action_col, []).append(
-            (action_slice, state_col, state_slice, action_padding, state_padding)
+            (
+                action_slice,
+                state_col,
+                state_slice,
+                action_padding,
+                state_padding,
+                rotation_type,
+                target_rotation,
+                action_key,
+            )
         )
 
     return action_col_slices
+
+
+# Index of each field in the slice tuples returned by _get_action_col_slices.
+# (action_slice, state_col, state_slice, action_padding, state_padding,
+#  rotation_type, target_rotation, action_key)
+_SLICE_ACTION = 0
+_SLICE_STATE_COL = 1
+_SLICE_STATE = 2
+_SLICE_ACTION_PAD = 3
+_SLICE_STATE_PAD = 4
+_SLICE_ROT_TYPE = 5
+_SLICE_TARGET_ROT = 6
+_SLICE_ACTION_KEY = 7
+
+# Key under which per-field rotation statistics (in the target representation) are
+# stored in the returned statistics dict. Consumed by _get_metadata (Step 5).
+ROTATION_STATS_KEY = "__rotation_stats__"
+
+
+def _get_chunk_padded(
+    array: np.ndarray, step_indices: np.ndarray, padding_strategy: str
+) -> np.ndarray:
+    """Gather rows at step_indices, padding out-of-range positions.
+
+    'first_last' repeats the first/last row (absolute fields); 'zero' zero-pads
+    (non-absolute fields). Shared by delta/rel statistics.
+    """
+    max_length = array.shape[0]
+    front_padding = step_indices < 0
+    end_padding = step_indices >= max_length
+    padding_positions = np.logical_or(front_padding, end_padding)
+    output = np.zeros((len(step_indices), array.shape[1]), dtype=array.dtype)
+    if (~padding_positions).any():
+        output[~padding_positions] = array[step_indices[~padding_positions]]
+    if padding_positions.any():
+        if padding_strategy == "first_last":
+            output[front_padding] = array[0]
+            output[end_padding] = array[-1]
+        elif padding_strategy == "zero":
+            output[padding_positions] = 0
+        else:
+            raise ValueError(f"Invalid padding strategy: {padding_strategy}")
+    return output
+
+
+def _six_stats(all_values: np.ndarray) -> dict:
+    """Compute the six per-dimension statistics over accumulated samples."""
+    all_values = all_values.astype(np.float32)
+    return {
+        "mean": np.mean(all_values, axis=0).tolist(),
+        "std": np.std(all_values, axis=0).tolist(),
+        "min": np.min(all_values, axis=0).tolist(),
+        "max": np.max(all_values, axis=0).tolist(),
+        "q01": np.quantile(all_values, 0.01, axis=0).tolist(),
+        "q99": np.quantile(all_values, 0.99, axis=0).tolist(),
+    }
+
+
+def _relative_action_statistics(
+    parquet_paths: list[Path],
+    lerobot_modality_meta: "LeRobotModalityMetadata",
+    action_keys_full: list[str],
+    state_keys_full: list[str],
+    action_indices: list[int],
+    state_indices: list[int],
+    action_mode: str,
+    action_mode_apply_keys: list[str] | None,
+    action_mode_state_map: dict[str, str] | None,
+    target_rotations: dict[str, str] | None,
+    base_stats: dict | None,
+) -> dict:
+    """Shared implementation for delta and rel action statistics.
+
+    For each mapped action field:
+      * Non-rotation fields (rotation_type is None): elementwise difference,
+        exactly as before (delta: a_t - a_{t-1}, a_0 - s_0; rel: a_t - s_0).
+        Statistics are accumulated at the full-column level so the existing
+        _get_metadata per-column slicing keeps producing byte-identical results
+        for datasets without rotation fields.
+      * Rotation fields (rotation_type set): the relative/delta rotation is
+        composed on SO(3) (R_ref^T @ R_t), then converted to the target
+        representation (from data_config target_rotations, default rotation_6d).
+        Statistics are accumulated per field in the TARGET representation and
+        returned under ROTATION_STATS_KEY, chunk-level (each chunk contributes
+        `len(action_indices)` samples), so t=0 rows sit near the identity
+        rotation and later rows spread out.
+    """
+    assert action_mode in ("delta", "rel")
+    if base_stats is None:
+        base_stats = calculate_dataset_statistics(parquet_paths)
+
+    action_col_slices = _get_action_col_slices(
+        lerobot_modality_meta,
+        action_keys_full,
+        state_keys_full,
+        action_mode_apply_keys,
+        action_mode_state_map,
+        target_rotations,
+    )
+    if not action_col_slices:
+        raise ValueError("No action columns found in the dataset.")
+
+    action_indices_arr = np.array(action_indices)
+    state_indices_arr = np.array(state_indices)
+
+    # Full-column accumulation (non-rotation content), preserved for backward compat.
+    accum: dict[str, list[np.ndarray]] = {col: [] for col in action_col_slices.keys()}
+    # Per-field rotation accumulation in target representation, keyed by action_key.
+    rot_accum: dict[str, list[np.ndarray]] = {}
+    rot_target: dict[str, str] = {}
+
+    desc = f"Collecting {action_mode} action stats"
+    for parquet_path in tqdm(sorted(list(parquet_paths)), desc=desc):
+        data = pd.read_parquet(parquet_path)
+        trajectory_length = len(data)
+        for action_col, slice_list in action_col_slices.items():
+            if action_col not in data.columns:
+                raise ValueError(f"{action_col} not found in parquet columns.")
+            action_matrix = np.stack(data[action_col])
+            action_padding_ref = slice_list[0][_SLICE_ACTION_PAD]
+            prepared_slices = []
+            for entry in slice_list:
+                state_col = entry[_SLICE_STATE_COL]
+                s_slice = entry[_SLICE_STATE]
+                if state_col not in data.columns:
+                    raise ValueError(f"{state_col} not found in parquet columns.")
+                state_matrix = np.stack(data[state_col])
+                state_part_full = state_matrix[:, s_slice[0] : s_slice[1]]
+                prepared_slices.append((entry, state_part_full))
+
+            for base_index in range(trajectory_length):
+                action_steps = action_indices_arr + base_index
+                action_chunk_full = _get_chunk_padded(
+                    action_matrix, action_steps, action_padding_ref
+                )
+
+                for entry, state_part_full in prepared_slices:
+                    a_slice = entry[_SLICE_ACTION]
+                    state_padding = entry[_SLICE_STATE_PAD]
+                    rotation_type = entry[_SLICE_ROT_TYPE]
+                    action_key = entry[_SLICE_ACTION_KEY]
+
+                    action_part_chunk = action_chunk_full[:, a_slice[0] : a_slice[1]]
+                    state_chunk = _get_chunk_padded(
+                        state_part_full, state_indices_arr + base_index, state_padding
+                    )
+                    if action_part_chunk.shape[1] != state_chunk.shape[1]:
+                        raise ValueError(f"Action/state dim mismatch for {action_col}:{a_slice}")
+
+                    if rotation_type is None:
+                        # Non-rotation field: elementwise difference (unchanged behavior).
+                        out = action_part_chunk.copy()
+                        if action_mode == "delta":
+                            if len(out) > 1:
+                                out[1:] = action_part_chunk[1:] - action_part_chunk[:-1]
+                            out[0] = action_part_chunk[0] - state_chunk[0]
+                        else:  # rel
+                            out = action_part_chunk - state_chunk[0]
+                        action_chunk_full[:, a_slice[0] : a_slice[1]] = out
+                    else:
+                        # Rotation field: compose on SO(3), then convert to target rep.
+                        target_rep = entry[_SLICE_TARGET_ROT] or "rotation_6d"
+                        ref_rot = state_chunk[0]  # (D_native,)
+                        if action_mode == "delta":
+                            rel = rot_utils.delta_rotation(
+                                action_part_chunk, ref_rot, rotation_type
+                            )
+                        else:  # rel
+                            rel = rot_utils.relative_rotation(
+                                action_part_chunk, ref_rot, rotation_type
+                            )
+                        converted = rot_utils.matrix_to_rotation(
+                            rot_utils.rotation_to_matrix(rel, rotation_type), target_rep
+                        )
+                        rot_accum.setdefault(action_key, []).append(converted)
+                        rot_target[action_key] = target_rep
+
+                accum[action_col].append(action_chunk_full)
+
+    stats = copy.deepcopy(base_stats)
+    for action_col, series_list in accum.items():
+        if not series_list:
+            continue
+        all_values = np.concatenate(series_list, axis=0)
+        stats[action_col] = _six_stats(all_values)
+
+    if rot_accum:
+        rotation_stats: dict[str, dict] = {}
+        for action_key, series_list in rot_accum.items():
+            all_values = np.concatenate(series_list, axis=0)
+            entry_stats = _six_stats(all_values)
+            entry_stats["__target_rotation__"] = rot_target[action_key]
+            rotation_stats[action_key] = entry_stats
+        stats[ROTATION_STATS_KEY] = rotation_stats
+
+    return stats
 
 
 def calculate_delta_action_statistics(
@@ -373,94 +625,34 @@ def calculate_delta_action_statistics(
     state_indices: list[int],
     action_mode_apply_keys: list[str] | None = None,
     action_mode_state_map: dict[str, str] | None = None,
+    target_rotations: dict[str, str] | None = None,
     base_stats: dict | None = None,
 ) -> dict:
     """
     Calculate action statistics using delta mode.
 
-    Rule:
+    Rule (non-rotation fields):
       - For t>0: a_t - a_{t-1}
       - For t=0: a_0 - s_0
+    Rotation fields compose on SO(3) instead (see _relative_action_statistics).
 
     Mapping rule (only two cases):
       1) Use explicit action_mode_state_map if provided.
       2) Otherwise, replace 'action.' with 'state.' directly.
     """
-    if base_stats is None:
-        base_stats = calculate_dataset_statistics(parquet_paths)
-
-    action_col_slices = _get_action_col_slices(
-        lerobot_modality_meta, action_keys_full, state_keys_full, action_mode_apply_keys, action_mode_state_map
+    return _relative_action_statistics(
+        parquet_paths=parquet_paths,
+        lerobot_modality_meta=lerobot_modality_meta,
+        action_keys_full=action_keys_full,
+        state_keys_full=state_keys_full,
+        action_indices=action_indices,
+        state_indices=state_indices,
+        action_mode="delta",
+        action_mode_apply_keys=action_mode_apply_keys,
+        action_mode_state_map=action_mode_state_map,
+        target_rotations=target_rotations,
+        base_stats=base_stats,
     )
-    if not action_col_slices:
-        raise ValueError("No action columns found in the dataset.")
-
-    def _get_chunk(array: np.ndarray, step_indices: np.ndarray, padding_strategy: str) -> np.ndarray:
-        max_length = array.shape[0]
-        front_padding = step_indices < 0
-        end_padding = step_indices >= max_length
-        padding_positions = np.logical_or(front_padding, end_padding)
-        output = np.zeros((len(step_indices), array.shape[1]), dtype=array.dtype)
-        if (~padding_positions).any():
-            output[~padding_positions] = array[step_indices[~padding_positions]]
-        if padding_positions.any():
-            if padding_strategy == "first_last":
-                output[front_padding] = array[0]
-                output[end_padding] = array[-1]
-            elif padding_strategy == "zero":
-                output[padding_positions] = 0
-            else:
-                raise ValueError(f"Invalid padding strategy: {padding_strategy}")
-        return output
-
-    accum: dict[str, list[np.ndarray]] = {col: [] for col in action_col_slices.keys()}
-    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting delta action stats"):
-        data = pd.read_parquet(parquet_path)
-        trajectory_length = len(data)
-        for action_col, slice_list in action_col_slices.items():
-            if action_col not in data.columns:
-                raise ValueError(f"{action_col} not found in parquet columns.")
-            action_matrix = np.stack(data[action_col])
-            action_padding_ref = slice_list[0][3]
-            prepared_slices = []
-            for a_slice, state_col, s_slice, action_padding, state_padding in slice_list:
-                if state_col not in data.columns:
-                    raise ValueError(f"{state_col} not found in parquet columns.")
-                state_matrix = np.stack(data[state_col])
-                state_part_full = state_matrix[:, s_slice[0] : s_slice[1]]
-                prepared_slices.append((a_slice, state_part_full, state_padding))
-            for base_index in range(trajectory_length):
-                action_steps = np.array(action_indices) + base_index
-                action_chunk_full = _get_chunk(action_matrix, action_steps, action_padding_ref)
-
-                for a_slice, state_part_full, state_padding in prepared_slices:
-                    action_part_chunk = action_chunk_full[:, a_slice[0] : a_slice[1]]
-                    state_chunk = _get_chunk(state_part_full, np.array(state_indices) + base_index, state_padding)
-                    if action_part_chunk.shape[1] != state_chunk.shape[1]:
-                        raise ValueError(f"Action/state dim mismatch for {action_col}:{a_slice}")
-
-                    out = action_part_chunk.copy()
-                    if len(out) > 1:
-                        out[1:] = action_part_chunk[1:] - action_part_chunk[:-1]
-                    out[0] = action_part_chunk[0] - state_chunk[0]
-                    action_chunk_full[:, a_slice[0] : a_slice[1]] = out
-
-                accum[action_col].append(action_chunk_full)
-
-    delta_stats = copy.deepcopy(base_stats)
-    for action_col, series_list in accum.items():
-        if not series_list:
-            continue
-        all_values = np.concatenate(series_list, axis=0).astype(np.float32)
-        delta_stats[action_col] = {
-            "mean": np.mean(all_values, axis=0).tolist(),
-            "std": np.std(all_values, axis=0).tolist(),
-            "min": np.min(all_values, axis=0).tolist(),
-            "max": np.max(all_values, axis=0).tolist(),
-            "q01": np.quantile(all_values, 0.01, axis=0).tolist(),
-            "q99": np.quantile(all_values, 0.99, axis=0).tolist(),
-        }
-    return delta_stats
 
 
 def calculate_rel_action_statistics(
@@ -472,90 +664,33 @@ def calculate_rel_action_statistics(
     state_indices: list[int],
     action_mode_apply_keys: list[str] | None = None,
     action_mode_state_map: dict[str, str] | None = None,
+    target_rotations: dict[str, str] | None = None,
     base_stats: dict | None = None,
 ) -> dict:
     """
     Calculate action statistics using rel mode.
 
-    Rule:
+    Rule (non-rotation fields):
       - For all t: a_t - s_0
+    Rotation fields compose on SO(3) instead (see _relative_action_statistics).
 
     Mapping rule (only two cases):
       1) Use explicit action_mode_state_map if provided.
       2) Otherwise, replace 'action.' with 'state.' directly.
     """
-    if base_stats is None:
-        base_stats = calculate_dataset_statistics(parquet_paths)
-
-    action_col_slices = _get_action_col_slices(
-        lerobot_modality_meta, action_keys_full, state_keys_full, action_mode_apply_keys, action_mode_state_map
+    return _relative_action_statistics(
+        parquet_paths=parquet_paths,
+        lerobot_modality_meta=lerobot_modality_meta,
+        action_keys_full=action_keys_full,
+        state_keys_full=state_keys_full,
+        action_indices=action_indices,
+        state_indices=state_indices,
+        action_mode="rel",
+        action_mode_apply_keys=action_mode_apply_keys,
+        action_mode_state_map=action_mode_state_map,
+        target_rotations=target_rotations,
+        base_stats=base_stats,
     )
-    if not action_col_slices:
-        raise ValueError("No action columns found in the dataset.")
-
-    def _get_chunk(array: np.ndarray, step_indices: np.ndarray, padding_strategy: str) -> np.ndarray:
-        max_length = array.shape[0]
-        front_padding = step_indices < 0
-        end_padding = step_indices >= max_length
-        padding_positions = np.logical_or(front_padding, end_padding)
-        output = np.zeros((len(step_indices), array.shape[1]), dtype=array.dtype)
-        if (~padding_positions).any():
-            output[~padding_positions] = array[step_indices[~padding_positions]]
-        if padding_positions.any():
-            if padding_strategy == "first_last":
-                output[front_padding] = array[0]
-                output[end_padding] = array[-1]
-            elif padding_strategy == "zero":
-                output[padding_positions] = 0
-            else:
-                raise ValueError(f"Invalid padding strategy: {padding_strategy}")
-        return output
-
-    accum: dict[str, list[np.ndarray]] = {col: [] for col in action_col_slices.keys()}
-    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting rel action stats"):
-        data = pd.read_parquet(parquet_path)
-        trajectory_length = len(data)
-        for action_col, slice_list in action_col_slices.items():
-            if action_col not in data.columns:
-                raise ValueError(f"{action_col} not found in parquet columns.")
-            action_matrix = np.stack(data[action_col])
-            action_padding_ref = slice_list[0][3]
-            prepared_slices = []
-            for a_slice, state_col, s_slice, action_padding, state_padding in slice_list:
-                if state_col not in data.columns:
-                    raise ValueError(f"{state_col} not found in parquet columns.")
-                state_matrix = np.stack(data[state_col])
-                state_part_full = state_matrix[:, s_slice[0] : s_slice[1]]
-                prepared_slices.append((a_slice, state_part_full, state_padding))
-            for base_index in range(trajectory_length):
-                action_steps = np.array(action_indices) + base_index
-                action_chunk_full = _get_chunk(action_matrix, action_steps, action_padding_ref)
-
-                for a_slice, state_part_full, state_padding in prepared_slices:
-                    action_part_chunk = action_chunk_full[:, a_slice[0] : a_slice[1]]
-                    state_chunk = _get_chunk(state_part_full, np.array(state_indices) + base_index, state_padding)
-                    if action_part_chunk.shape[1] != state_chunk.shape[1]:
-                        raise ValueError(f"Action/state dim mismatch for {action_col}:{a_slice}")
-
-                    out = action_part_chunk - state_chunk[0]
-                    action_chunk_full[:, a_slice[0] : a_slice[1]] = out
-
-                accum[action_col].append(action_chunk_full)
-
-    rel_stats = copy.deepcopy(base_stats)
-    for action_col, series_list in accum.items():
-        if not series_list:
-            continue
-        all_values = np.concatenate(series_list, axis=0).astype(np.float32)
-        rel_stats[action_col] = {
-            "mean": np.mean(all_values, axis=0).tolist(),
-            "std": np.std(all_values, axis=0).tolist(),
-            "min": np.min(all_values, axis=0).tolist(),
-            "max": np.max(all_values, axis=0).tolist(),
-            "q01": np.quantile(all_values, 0.01, axis=0).tolist(),
-            "q99": np.quantile(all_values, 0.99, axis=0).tolist(),
-        }
-    return rel_stats
 
 class ModalityConfig(BaseModel):
     """Configuration for a modality."""
@@ -830,8 +965,15 @@ class LeRobotSingleDataset(Dataset):
         normalized_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) if self.data_cfg else {}
         )
+        # Target rotation representations per action field (from data_config). Drives
+        # rotation-aware relative/delta statistics: rotation fields are composed on
+        # SO(3) and their stats computed in this target representation.
+        target_rotations = _normalize_target_rotations(
+            self.data_cfg.get("target_rotations", {}) if self.data_cfg else {}
+        )
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
+            target_rotations=target_rotations,
         )
         parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
         parquet_files_filtered = [
@@ -852,6 +994,7 @@ class LeRobotSingleDataset(Dataset):
                 state_indices=state_indices,
                 action_mode_apply_keys=apply_keys,
                 action_mode_state_map=normalized_state_map,
+                target_rotations=target_rotations,
             )
         else:
             le_statistics = None
@@ -870,7 +1013,12 @@ class LeRobotSingleDataset(Dataset):
                     f"Dataset statistics cache is missing or invalid after sync: {stats_path}"
                 )
 
-        for stat in le_statistics.values():
+        # Per-field rotation statistics (target representation) live under a reserved
+        # key; validate the regular per-column entries only.
+        rotation_stats = le_statistics.get(ROTATION_STATS_KEY, {})
+        for stat_key, stat in le_statistics.items():
+            if stat_key == ROTATION_STATS_KEY:
+                continue
             DatasetStatisticalValues.model_validate(stat)
 
 
@@ -882,6 +1030,26 @@ class LeRobotSingleDataset(Dataset):
                 state_action_meta = le_modality_meta.get_key_meta(f"{our_modality}.{subkey}")
                 assert isinstance(state_action_meta, LeRobotStateActionMetadata)
                 le_modality = state_action_meta.original_key
+
+                # Rotation field converted to a target representation: use the
+                # per-field stats computed in that target representation (correct
+                # dimensionality), instead of slicing the raw per-column stats
+                # (which are in the native representation and a different length).
+                rot_key = f"{our_modality}.{subkey}"
+                if rot_key in rotation_stats:
+                    field_stats = rotation_stats[rot_key]
+                    target_rep = field_stats.get("__target_rotation__")
+                    for stat_name, values in field_stats.items():
+                        if stat_name == "__target_rotation__":
+                            continue
+                        dataset_statistics[our_modality][subkey][stat_name] = list(values)
+                    # Reflect the target-representation dimensionality in the modality meta.
+                    if target_rep is not None:
+                        simplified_modality_meta[our_modality][subkey]["shape"] = [
+                            rot_utils.representation_dim(target_rep)
+                        ]
+                    continue
+
                 for stat_name in le_statistics[le_modality]:
                     indices = np.arange(
                         state_action_meta.start,
@@ -1207,6 +1375,7 @@ class LeRobotSingleDataset(Dataset):
         return delta_indices
 
     def _init_action_mode(self) -> None:
+        self._action_rotation_types = {}
         if self.data_cfg is None:
             self._action_mode = "abs"
             return
@@ -1226,6 +1395,23 @@ class LeRobotSingleDataset(Dataset):
         self._action_mode_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) or {}
         )
+
+    def _get_action_rotation_type(self, action_key: str):
+        """Native rotation representation for an action field, or None.
+
+        A field is rotation-aware iff modality.json declares its rotation_type.
+        Cached per key; built lazily since it needs the parsed modality metadata.
+        """
+        if action_key in self._action_rotation_types:
+            return self._action_rotation_types[action_key]
+        rotation_type = None
+        try:
+            meta = self._lerobot_modality_meta.get_key_meta(action_key)
+            rotation_type = getattr(meta, "rotation_type", None)
+        except Exception:
+            rotation_type = None
+        self._action_rotation_types[action_key] = rotation_type
+        return rotation_type
 
     def _infer_state_key_for_action(self, action_key: str) -> str | None:
         if action_key in self._action_mode_state_map:
@@ -1264,16 +1450,30 @@ class LeRobotSingleDataset(Dataset):
                     f"Action/state dim mismatch for {action_key} vs {state_key}: {action_values.shape} vs {state_values.shape}"
                 )
 
+            rotation_type = self._get_action_rotation_type(action_key)
             state0 = state_values[0]
-            if self._action_mode == "delta":
-                out = action_values.copy()
-                if len(out) > 1:
-                    out[1:] = action_values[1:] - action_values[:-1]
-                out[0] = action_values[0] - state0
-            elif self._action_mode == "rel":
-                out = action_values - state0
+            if rotation_type is not None:
+                # Rotation field: compose on SO(3), keep NATIVE representation.
+                # The downstream StateActionTransform converts native -> target and
+                # normalizes with the (rotation-aware) statistics. This mirrors the
+                # statistics math in _relative_action_statistics exactly.
+                if self._action_mode == "delta":
+                    out = rot_utils.delta_rotation(action_values, state0, rotation_type)
+                elif self._action_mode == "rel":
+                    out = rot_utils.relative_rotation(action_values, state0, rotation_type)
+                else:
+                    out = action_values
             else:
-                out = action_values
+                # Non-rotation field: elementwise difference (unchanged behavior).
+                if self._action_mode == "delta":
+                    out = action_values.copy()
+                    if len(out) > 1:
+                        out[1:] = action_values[1:] - action_values[:-1]
+                    out[0] = action_values[0] - state0
+                elif self._action_mode == "rel":
+                    out = action_values - state0
+                else:
+                    out = action_values
 
             data[action_key] = out
 
@@ -1940,6 +2140,11 @@ class LeRobotSingleDataset(Dataset):
         print(f"Used state keys (reordered): {list(used_state_keys)}")
 
 class X2WLeRobotSingleDataset(LeRobotSingleDataset):
+    # TODO(user): x2w-specific, safe to remove.
+    # This subclass overrides get_step_data and does NOT invoke the rotation-aware
+    # relative/delta action pipeline (_apply_action_mode). The rotation-representation
+    # feature targets the generic EEF path via the base LeRobotSingleDataset. When the
+    # x2w path is retired, delete this class and its registry/mixture references.
     def __init__(self, *args, **kwargs):
         """
         Loading the specific LeRobot dataset from X2W.
