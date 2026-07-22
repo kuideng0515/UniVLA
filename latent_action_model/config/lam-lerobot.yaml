@@ -25,7 +25,7 @@ model:
 data:
   data_root_dir: /mnt/pfs/dengyiqi/datasets
   data_mix: x2w_wm_dataset       # resolved via DATASET_NAMED_MIXTURES (see dataloader/gr00t_lerobot/mixtures.py)
-  batch_size: 64
+  batch_size: 96
   frame_interval: 30             # 0.5s @ 30 fps; set to 30 for 1.0s
   image_aug: true                # enable video augmentations (crop + color jitter)
   video_backend: torchcodec

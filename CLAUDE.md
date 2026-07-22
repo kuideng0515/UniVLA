@@ -60,21 +60,44 @@ UniVLA —— 一个 VLA（视觉-语言-动作）模型仓库。当前活跃开
 - 补充：`lerobot_datasets.py` 里把 DataConfig 的 `target_rotations` 注入 `data_cfg`，让统计管线与运行时转换用同一目标表示（属同一特性）。
 - ⏳ 下一步：单独提交这块。
 
-**主线 B — GPU 利用率瓶颈排查：已定位，结论明确（GPU 解码路线排除）。**
+**主线 B — GPU 利用率瓶颈排查：已定位并被端到端实测印证；结论明确（GPU 解码路线排除，格式换 LeRobot 3.0 也无用）。**
 - 目标：训练稳态 GPU 利用率 ≥90%。旧 commit `ca2966b` 记的「GPU 4%」是**冷启动假象**（首 batch 要重算统计 + 解码预热 + worker 启动），非稳态。
-- **已应用 3 项 CPU 侧优化（约 +15%，保留）：**
+- **✅ 端到端实测基准（2026-07-22，用户实跑 `train_lam.sh`，H20/97GB/23核，已含下述 3 项优化）：**
+
+  | batch | it/s | ≈samples/s | epoch步数 | 峰值显存 | GPU利用率 |
+  |---|---|---|---|---|---|
+  | 64 | 1.15 | ~74 | 680 | 40.6 GB | 70–80% |
+  | 96 | 0.83 | ~80 (+8%) | 453 | ~61 GB | — |
+  | 128 | 0.66 | ~84 (+14%) | 340 | ~81 GB | 更高 |
+
+  - 看 **samples/s** 而非 it/s（it/s 下降只是因每步样本变多）。更大 batch 让单步 GPU 更久 → dataloader 有更多时间备下一批 → GPU 空等更少、利用率更高。
+  - **边际收益递减**：64→96 得 +8%，96→128 再得 +5%。因根本瓶颈始终是 CPU 解码 ~85 samples/s 的墙，batch 再大只是填 GPU 空隙。**96 是显存/吞吐的较优平衡点**（拿到大部分收益，显存比 128 宽裕）。
+  - **注意**：batch 翻倍若要正经训练需相应上调 lr（当前 `optimizer.init_args.lr: 1e-4`）；测速度可先不动。
+  - 这与瓶颈分析完全吻合。**此即当前可接受的现状基准，未继续追 90%。**
+
+- **⚠️ 换 A100 前必看（用户计划迁 A100 测试）：**
+  - A100 只有 **40GB / 80GB** 两种规格，均 < H20 的 97GB。显存换算（LAM stage-1，本配置）：batch64≈40.6GB / 96≈61GB / 128≈81GB。
+    - **A100-40GB**：batch96/128 都装不下，约只能到 **batch48–56**。
+    - **A100-80GB**：batch96 可以，batch128（~81GB）非常贴边有 OOM 风险，建议 **≤112**。
+  - A100 算力低于 H20，单步 GPU 会更久；但**真正瓶颈是 CPU 解码，取决于 A100 机器给多少 CPU 核**——核数 ≥23 吞吐可能持平/更好，核数更少会更差。**换卡前先确认该机器的 CPU 核数与 A100 显存规格，比调 batch 更重要。**
+  - A100 是 **sm_80**，torch 2.7.0+cu126 wheel 直接支持；见 README「跨平台复现」表。
+- **已应用 3 项 CPU 侧优化（保留）：**
   1. 冻结 DINOv2 用 `torch.no_grad()` 包住（`genie/modules/lam.py` 两个 LAM 类的 `vq_encode`）——该 stage 快 ~13% + 省激活显存。
   2. `num_workers: 8 → 12`（`config/lam-lerobot.yaml`，23 核机器上 12 是吞吐甜点，>12 超订变慢）。
   3. 启用 `prefetch_factor=4`（`dataloader/lam_datamodule.py`，原来注释掉了）。
 - **实测数据（H20，97GB，23 核）：**
   - GPU 单步 fwd+bwd = 606 ms @ batch64 → 需 ~106 samples/s 才喂满；峰值显存仅 40.6/97 GB。
-  - CPU 解码多进程扩展**线性**，但 23 核封顶 ~120 samples/s，实测 16 workers ~97–117 samples/s——**刚好压在 GPU 需求线附近**，所以稳态 GPU 卡 ~65%。
+  - CPU 解码多进程扩展**线性**，但 23 核封顶 ~120 samples/s——**刚好压在 GPU 需求线附近**，所以稳态 GPU 卡 70–80%。
   - 瓶颈 = **CPU 视频解码并行度不足**，本质是「23 核喂不饱 H20」，非代码问题。
 - **GPU (NVDEC) 解码调查 → 负收益，已排除：**
   - x2w 数据（`4473_to_4475`）是 **AV1 1280×720**，H20 NVDEC **不支持 AV1**（`av1_cuvid` capabilities 全 0）——硬件限制，无解。
-  - dagger 数据（`dagger_data/`）是 **H.264 640×400**，H20 NVDEC 支持。为此克隆环境 `lams_gpu` 并从 `download.pytorch.org/whl/cu126` 装了 `torchcodec==0.5+cu126`（带 NVDEC；系统 `libavcodec.so.60` 匹配其 core6）。**GPU 解码成功跑通**，但性能实测：真实访问模式（大量不同 episode、每个只取相隔30的2帧）下 GPU 5 samples/s vs CPU 17 samples/s（单线程），**GPU 慢 3.4×**。原因：NVDEC 建解码上下文固定开销 88ms（CPU 29ms），而每样本只解 2 帧无法摊薄；NVDEC 在单 GPU 上也难像 CPU 那样多进程线性扩展。
-  - **关键教训：GPU 视频解码只在「同一文件大批量/连续解码」才划算；LAM 这种「海量小文件随机取几帧」的模式，GPU 解码是负收益。** `lams_gpu` 环境可删。
-- **唯一确定能到 90% 的方向：加 CPU 核**（换更多 vCPU 的机器/多机），解码吞吐随核线性涨。未来数据切 LeRobot 3.0（多 episode 合一文件）只省 ~23% 的「打开文件」开销，解决不了占 ~77% 的 seek+解码成本。
+  - dagger 数据（`dagger_data/`）是 **H.264 640×400**，H20 NVDEC 支持。为此克隆环境 `lams_gpu`（已建好、可用；torch 2.7.0+cu126 / torchcodec 0.5+cu126），从 `download.pytorch.org/whl/cu126` 装了带 NVDEC 的 `torchcodec==0.5+cu126`。**GPU 解码成功跑通**，但性能实测：真实访问模式（大量不同 episode、每个只取相隔30的2帧）下 GPU 5 samples/s vs CPU 17 samples/s（单线程），**GPU 慢 3.4×**。原因：NVDEC 建解码上下文固定开销 88ms（CPU 29ms），而每样本只解 2 帧无法摊薄；NVDEC 在单 GPU 上也难像 CPU 那样多进程线性扩展。
+  - **关键教训：GPU 视频解码只在「同一文件大批量/连续解码」才划算；LAM 这种「海量小文件随机取几帧」的模式，GPU 解码是负收益。** `lams_gpu` 环境结论已得、可删。
+- **LeRobot 3.0 格式实测 → 更慢，不解决瓶颈（曾以为能救，实测否定）：**
+  - 用 `/mnt/pfs/dataset/lerobot_data/g2a_task_201_307_0711_0721/`（v3.0，H.264，多 episode 合并进 ~4000 帧/~150MB 的大文件）实测解码拆解：仅打开文件 **14.1ms**（vs 单-episode 文件的 4ms），真实 getitem **24.3ms**（vs 16.7ms），单核 **41 clip/s**（vs 60）。
+  - 原因：合并虽减少文件数，但单个大文件「建帧索引」的打开成本更高、大文件内随机 seek 距关键帧更远——**合并省下的打开次数被单次更贵抵消还超支**。v3.0 优化的是存储/元数据管理，**不是随机访问解码吞吐**。
+  - **结论：换 LeRobot 3.0 不能提升（反而降低）解码吞吐，不要指望它救 GPU 利用率。**
+- **唯一确定能到 90% 的方向：加 CPU 核**（换更多 vCPU 的机器/多机），解码吞吐随核线性涨。**CPU 更弱的平台会更受限**，需下调 `num_workers` 并预期更低利用率。
 - profiling / 监控脚本已跑完结论、**已删除**（`bench_dataloader.py` / `profile_step.py` / `monitor_train.py`）——结论都固化进本文件与 README，无需保留。
 
 **文档已更新（为跨平台复现）：**
